@@ -222,3 +222,30 @@ def get_advice(field_id: int, db: Session = Depends(get_db)):
         net_deficit_mm=round(net_deficit, 1),
         messages=msgs,
     )
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class IrrigationInput(BaseModel):
+    crop: str = Field(..., examples=["wheat", "maize", "cotton", "rice"])
+    soil_moisture_pct: float = Field(..., ge=0, le=100, examples=[22.5])
+    rainfall_forecast_mm: float = Field(..., ge=0, examples=[5.0])
+    temp_c: float = Field(..., ge=-20, le=60, examples=[32.0])
+    et0_mm: Optional[float] = Field(None, ge=0, examples=[4.2])
+
+@app.post("/api/v1/irrigation/recommendation")
+def irrigation_recommendation(inp: IrrigationInput):
+    thresholds = {"wheat": 30, "maize": 35, "cotton": 35, "rice": 45}
+    t = thresholds.get(inp.crop.lower(), 30)
+    rain_credit = min(inp.rainfall_forecast_mm, 10) * 0.8
+    heat_penalty = 5 if inp.temp_c >= 35 else 0
+    et_penalty = 3 if (inp.et0_mm or 0) >= 5 else 0
+    adjusted = inp.soil_moisture_pct + rain_credit - heat_penalty - et_penalty
+    need = adjusted < t
+    mm = max(0.0, round(t - adjusted, 1)) * 1.2
+    return {
+        "crop": inp.crop,
+        "adjusted_moisture_score": round(adjusted, 1),
+        "threshold": t,
+        "need_irrigation": need,
+        "recommended_irrigation_mm": round(mm, 1),
+    }
