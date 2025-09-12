@@ -1,0 +1,13 @@
+from sqlalchemy import Column, Integer, String, Float, Text
+from .db import Base
+
+class Field(Base):
+    __tablename__ = "fields"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(120), nullable=False)
+    crop = Column(String(80), nullable=False)
+    centroid_lat = Column(Float, nullable=False)
+    centroid_lon = Column(Float, nullable=False)
+    polygon_geojson = Column(Text, nullable=True)  # optional for later
+    last_irrigation_ts = Column(Integer, nullable=True)  # unix seconds
