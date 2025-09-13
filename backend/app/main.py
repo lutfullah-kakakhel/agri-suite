@@ -1,6 +1,7 @@
 # app/main.py
 import os
 import math
+import psycopg #v3
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -11,6 +12,15 @@ from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Text, DateTime
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
+
+
+def get_conn():
+    return psycopg.connect(
+        os.getenv("DATABASE_URL"),
+        autocommit=True,
+        sslmode=os.getenv("POSTGRES_SSLMODE", "require"),
+    )
+
 
 # ---------------------------
 # Configuration / Database
