@@ -1,0 +1,15 @@
+# global
+.venv/
+.env
+__pycache__/
+*.pyc
+.DS_Store
+
+# backend
+backend/data/
+backend/*.db
+
+# frontend
+frontend/build/
+frontend/.dart_tool/
+frontend/ios/Pods/
