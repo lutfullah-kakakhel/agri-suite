@@ -50,13 +50,15 @@ app.add_middleware(
 
 # ========= Root / readiness / health =========
 
-@app.get("/")
+# ========= Root / readiness / health =========
+
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
+    # For HEAD, FastAPI will return 200 with no body automatically
     return {"status": "ok", "service": "agri-suite-api"}
 
-@app.get("/readyz")
+@app.api_route("/readyz", methods=["GET", "HEAD"])
 def readyz():
-    # Render health check should point here (no DB access)
     return {"ok": True}
 
 @app.get("/healthz")
@@ -70,7 +72,6 @@ def healthz():
             media_type="application/json",
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
-
 
 # ========= Field endpoints =========
 
