@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, declarative_base
 
 
 def _to_psycopg_v3_url(url: str) -> str:
@@ -16,6 +16,9 @@ def _to_psycopg_v3_url(url: str) -> str:
 
 
 DATABASE_URL = _to_psycopg_v3_url(os.environ["DATABASE_URL"])
+
+# Declarative base for models to inherit from
+Base = declarative_base()
 
 # Small, robust pool for Render Free tier + Supabase pooler
 engine = create_engine(
