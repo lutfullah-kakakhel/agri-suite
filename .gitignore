@@ -16,3 +16,5 @@ frontend/ios/Pods/
 
 __pycache__/
 *.pyc
+
+.env
