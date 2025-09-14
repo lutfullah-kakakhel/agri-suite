@@ -1,261 +1,139 @@
-# app/main.py
-import os
-import math
-import psycopg #v3
-from datetime import datetime, timezone
-from typing import List, Optional
+# backend/app/main.py
+import json
+from datetime import date, timedelta
+from typing import Any, Dict, List
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field as PydField, field_validator
-from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, Text, DateTime
-)
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from .db import engine, SessionLocal, Base, ping
 
 
-def get_conn():
-    return psycopg.connect(
-        os.getenv("DATABASE_URL"),
-        autocommit=True,
-        sslmode=os.getenv("POSTGRES_SSLMODE", "require"),
-    )
-
-
-# ---------------------------
-# Configuration / Database
-# ---------------------------
-# Load DATABASE_URL from environment; default to local SQLite under ./data
-DB_URL = os.getenv("DATABASE_URL", "sqlite:///./data/app.db")
-
-# If using local relative SQLite, ensure folder exists
-if DB_URL.startswith("sqlite:///./"):
-    os.makedirs("./data", exist_ok=True)
-
-# SQLite needs check_same_thread=False for FastAPI sync sessions
-engine = create_engine(
-    DB_URL,
-    connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {},
-    pool_pre_ping=True,
-)
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-Base = declarative_base()
-
-# ---------------------------
-# SQLAlchemy Model
-# ---------------------------
-class Field(Base):
-    __tablename__ = "fields"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(120), nullable=False)
-    crop = Column(String(80), nullable=False)
-    centroid_lat = Column(Float, nullable=False)
-    centroid_lon = Column(Float, nullable=False)
-    polygon_geojson = Column(Text, nullable=True)
-    last_irrigation_ts = Column(DateTime(timezone=True), nullable=True)
-
-Base.metadata.create_all(bind=engine)
-
-# ---------------------------
-# Pydantic Schemas
-# ---------------------------
-class FieldCreate(BaseModel):
-    name: str
-    crop: str
-    centroid_lat: float = PydField(..., ge=-90, le=90)
-    centroid_lon: float = PydField(..., ge=-180, le=180)
-    polygon_geojson: Optional[str] = None
-    last_irrigation_ts: Optional[datetime] = None
-
-    @field_validator("name", "crop")
-    @classmethod
-    def nonempty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("must not be empty")
-        return v.strip()
-
-class FieldOut(BaseModel):
-    id: int
-    name: str
-    crop: str
-    centroid_lat: float
-    centroid_lon: float
-    polygon_geojson: Optional[str] = None
-    last_irrigation_ts: Optional[datetime] = None
-
-    class Config:
-        from_attributes = True  # for SQLAlchemy -> Pydantic
-
-# Advice payload
-class AdviceToday(BaseModel):
-    tmin_c: float
-    tmax_c: float
-    rain_mm: float
-    rain_prob_pct: int
-    et0_mm: float
-
-class AdviceMessage(BaseModel):
-    en: str
-    ur: str
-
-class AdviceOut(BaseModel):
-    field: str
-    crop: str
-    today: AdviceToday
-    since_last_irrigation_days: int
-    net_deficit_mm: float
-    messages: List[AdviceMessage]
-
-# ---------------------------
-# FastAPI app
-# ---------------------------
-app = FastAPI(title="Irrigation Advisory API")
-
-# Allow mobile/web clients (adjust origins as needed)
+app = FastAPI(title="Irrigation API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict in production
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-# Dependency to get a DB session per request
+
 def get_db() -> Session:
-    db = SessionLocal()
+    db: Session = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-# ---------------------------
-# Endpoints
-# ---------------------------
+
 @app.get("/healthz")
 def healthz():
+    ping()
     return {"ok": True}
 
-@app.get("/fields", response_model=List[FieldOut])
-def list_fields(db: Session = Depends(get_db)):
-    return db.query(Field).order_by(Field.id.desc()).all()
 
-@app.post("/fields", response_model=FieldOut)
-def create_field(payload: FieldCreate, db: Session = Depends(get_db)):
-    rec = Field(
-        name=payload.name,
-        crop=payload.crop,
-        centroid_lat=payload.centroid_lat,
-        centroid_lon=payload.centroid_lon,
-        polygon_geojson=payload.polygon_geojson,
-        last_irrigation_ts=payload.last_irrigation_ts,
-    )
-    db.add(rec)
-    db.commit()
-    db.refresh(rec)
-    return rec
+def _polygon_wkt_from_geojson(gj: Dict[str, Any]) -> str:
+    """Expect GeoJSON Polygon with coordinates [[ [lng,lat], ... ]]."""
+    if not (gj and gj.get("type") == "Polygon"):
+        raise ValueError("boundary_geojson must be a GeoJSON Polygon")
+    coords: List[List[float]] = gj["coordinates"][0]
+    if coords[0] != coords[-1]:
+        coords.append(coords[0])  # close ring
+    ring = ", ".join(f"{lng} {lat}" for lng, lat in coords)
+    return f"POLYGON(({ring}))"
 
-@app.get("/fields/{field_id}", response_model=FieldOut)
-def get_field(field_id: int, db: Session = Depends(get_db)):
-    rec = db.query(Field).filter(Field.id == field_id).first()
-    if not rec:
-        raise HTTPException(status_code=404, detail="Field not found")
-    return rec
 
-@app.get("/fields/{field_id}/advice", response_model=AdviceOut)
-def get_advice(field_id: int, db: Session = Depends(get_db)):
-    rec = db.query(Field).filter(Field.id == field_id).first()
-    if not rec:
-        raise HTTPException(status_code=404, detail="Field not found")
+@app.post("/fields")
+def create_field(payload: Dict[str, Any], db: Session = Depends(get_db)):
+    farm_id = payload.get("farm_id")
+    name = payload.get("name")
+    gj = payload.get("boundary_geojson")
 
-    # --- Simple placeholder weather/ET0 logic (replace with real fetch later) ---
-    # You can wire your real weather + ET₀ function here.
-    # For now we compute a very rough ET0 using Hargreaves-like approximation.
-    # Note: these numbers are dummies just to keep the contract stable.
-    tmin = 22.0
-    tmax = 34.0
-    tmean = (tmin + tmax) / 2
-    # crude diurnal range
-    td = max(0.1, tmax - tmin)
-    # rough extraterrestrial radiation scaling for plains (very approximate)
-    et0 = 0.0023 * (tmean + 17) * math.sqrt(td) * 10.0  # ~mm/day
+    if not farm_id or not name or not gj:
+        raise HTTPException(400, "farm_id, name, boundary_geojson are required")
 
-    rain_mm = 1.0
-    rain_prob = 30
+    try:
+        wkt = _polygon_wkt_from_geojson(gj)
+    except Exception as e:
+        raise HTTPException(400, f"Invalid GeoJSON polygon: {e}")
 
-    # days since last irrigation
-    if rec.last_irrigation_ts:
-        delta_days = max(0, int((datetime.now(timezone.utc) - rec.last_irrigation_ts).total_seconds() // 86400))
-    else:
-        delta_days = 3  # default assumption
+    row = db.execute(
+        text("""
+            INSERT INTO fields (farm_id, name, boundary)
+            VALUES (:farm_id, :name, ST_GeomFromText(:wkt, 4326))
+            RETURNING id, farm_id, name,
+                      area_ha,
+                      ST_AsGeoJSON(ST_ForcePolygonCCW(boundary)) AS boundary_geojson
+        """),
+        {"farm_id": farm_id, "name": name, "wkt": wkt},
+    ).mappings().first()
 
-    # very rough crop coefficient and soil bucket
-    kc = 0.9
-    daily_use = et0 * kc
-    net_deficit = max(0.0, daily_use * delta_days - rain_mm)
+    if not row:
+        raise HTTPException(500, "Insert failed")
 
-    # Messages (English + Urdu)
-    if net_deficit < 10:
-        msgs = [
-            AdviceMessage(
-                en="Conditions are normal. Monitor the next forecast.",
-                ur="صورتحال معمول کی ہے۔ اگلی موسمی پیشن گوئی پر نظر رکھیں۔",
-            )
-        ]
-    elif net_deficit < 25:
-        msgs = [
-            AdviceMessage(
-                en=f"Field is drying (deficit ≈ {net_deficit:.1f} mm). Plan irrigation within 1–2 days.",
-                ur=f"کھیت میں نمی کم ہو رہی ہے (کمی تقریباً {net_deficit:.1f} ملی میٹر)۔ ۱–۲ دن میں آبپاشی کیجئے۔",
-            )
-        ]
-    else:
-        msgs = [
-            AdviceMessage(
-                en=f"Deficit high (≈ {net_deficit:.1f} mm). Irrigate now if field is available.",
-                ur=f"کمی زیادہ ہے (تقریباً {net_deficit:.1f} ملی میٹر)۔ اگر ممکن ہو تو فوراً آبپاشی کریں۔",
-            )
-        ]
-
-    today = AdviceToday(
-        tmin_c=tmin,
-        tmax_c=tmax,
-        rain_mm=rain_mm,
-        rain_prob_pct=rain_prob,
-        et0_mm=round(et0, 1),
-    )
-
-    return AdviceOut(
-        field=rec.name,
-        crop=rec.crop,
-        today=today,
-        since_last_irrigation_days=delta_days,
-        net_deficit_mm=round(net_deficit, 1),
-        messages=msgs,
-    )
-from pydantic import BaseModel, Field
-from typing import Optional
-
-class IrrigationInput(BaseModel):
-    crop: str = Field(..., examples=["wheat", "maize", "cotton", "rice"])
-    soil_moisture_pct: float = Field(..., ge=0, le=100, examples=[22.5])
-    rainfall_forecast_mm: float = Field(..., ge=0, examples=[5.0])
-    temp_c: float = Field(..., ge=-20, le=60, examples=[32.0])
-    et0_mm: Optional[float] = Field(None, ge=0, examples=[4.2])
-
-@app.post("/api/v1/irrigation/recommendation")
-def irrigation_recommendation(inp: IrrigationInput):
-    thresholds = {"wheat": 30, "maize": 35, "cotton": 35, "rice": 45}
-    t = thresholds.get(inp.crop.lower(), 30)
-    rain_credit = min(inp.rainfall_forecast_mm, 10) * 0.8
-    heat_penalty = 5 if inp.temp_c >= 35 else 0
-    et_penalty = 3 if (inp.et0_mm or 0) >= 5 else 0
-    adjusted = inp.soil_moisture_pct + rain_credit - heat_penalty - et_penalty
-    need = adjusted < t
-    mm = max(0.0, round(t - adjusted, 1)) * 1.2
     return {
-        "crop": inp.crop,
-        "adjusted_moisture_score": round(adjusted, 1),
-        "threshold": t,
-        "need_irrigation": need,
-        "recommended_irrigation_mm": round(mm, 1),
+        "id": row["id"],
+        "farm_id": row["farm_id"],
+        "name": row["name"],
+        "area_ha": float(row["area_ha"]) if row["area_ha"] is not None else None,
+        "boundary_geojson": json.loads(row["boundary_geojson"]),
     }
+
+
+@app.patch("/fields/{field_id}")
+def update_field(field_id: str, payload: Dict[str, Any], db: Session = Depends(get_db)):
+    allowed = ("crop", "sowing_date", "soil", "kc_profile")
+    set_clauses = []
+    params: Dict[str, Any] = {"field_id": field_id}
+
+    for key in allowed:
+        if key in payload:
+            set_clauses.append(f"{key} = :{key}")
+            params[key] = json.dumps(payload[key]) if key == "kc_profile" else payload[key]
+
+    if not set_clauses:
+        return {"updated": False}
+
+    db.execute(text(f"UPDATE fields SET {', '.join(set_clauses)} WHERE id = :field_id"), params)
+    db.commit()
+    return {"updated": True}
+
+
+@app.post("/fields/{field_id}/seed-schedule")
+def seed_schedule(field_id: str, payload: Dict[str, Any], db: Session = Depends(get_db)):
+    target = float(payload.get("target_event_mm", 40))
+    eff = float(payload.get("system_efficiency", 0.8))
+    days = int(payload.get("days", 45))
+
+    r = db.execute(text("SELECT area_ha FROM fields WHERE id = :id"), {"id": field_id}).first()
+    if not r:
+        raise HTTPException(404, "field not found")
+
+    area_ha = float(r[0]) if r[0] is not None else 0.0
+
+    events = []
+    d = date.today()
+    while len(events) * 7 < days:
+        net_mm = target
+        gross_mm = round(net_mm / eff, 1)
+        vol_m3 = round(gross_mm * area_ha * 10.0, 1) if area_ha else None
+        events.append({"date": d.isoformat(), "net_mm": net_mm, "gross_mm": gross_mm, "volume_m3": vol_m3})
+        d += timedelta(days=7)
+
+    return {"events": events}
+
+
+@app.post("/fields/{field_id}/schedules")
+def save_schedule(field_id: str, payload: Dict[str, Any], db: Session = Depends(get_db)):
+    events = payload.get("events", [])
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS schedules (
+          field_id UUID REFERENCES fields(id) ON DELETE CASCADE,
+          body JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """))
+    db.execute(text("INSERT INTO schedules (field_id, body) VALUES (:fid, CAST(:body AS JSONB))"),
+               {"fid": field_id, "body": json.dumps(events)})
+    db.commit()
+    return {"saved": True, "count": len(events)}

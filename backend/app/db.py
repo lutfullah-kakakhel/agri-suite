@@ -1,24 +1,30 @@
-from pathlib import Path
+# backend/app/db.py
+import os
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATA_DIR = Path("/opt/irrigation-api/data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "irrigation.db"
 
-# SQLite engine (check_same_thread False allows use across threads in FastAPI)
+def _to_psycopg_v3_url(url: str) -> str:
+    """Force SQLAlchemy to use the psycopg v3 dialect."""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+psycopg://", 1)
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
+
+
+DATABASE_URL = _to_psycopg_v3_url(os.environ["DATABASE_URL"])
+
 engine = create_engine(
-    f"sqlite:///{DB_PATH}",
-    connect_args={"check_same_thread": False},
+    DATABASE_URL,
     pool_pre_ping=True,
 )
 
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 
-def init_pragmas():
-    # Enable WAL for better concurrency + durability; turn on FK checks
-    with engine.begin() as conn:
-        conn.execute(text("PRAGMA journal_mode=WAL;"))
-        conn.execute(text("PRAGMA synchronous=NORMAL;"))
-        conn.execute(text("PRAGMA foreign_keys=ON;"))
+
+def ping() -> None:
+    """Simple connectivity check. Raises if the DB is unreachable."""
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
