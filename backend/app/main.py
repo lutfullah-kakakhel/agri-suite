@@ -3,12 +3,12 @@ import json
 from datetime import date, timedelta
 from typing import Any, Dict, List
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from .db import engine, SessionLocal, Base, ping
+from .db import engine, SessionLocal, Base, ping, get_db
 
 
 app = FastAPI(title="Irrigation API")
@@ -16,6 +16,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "agri-suite-api"}
 
 
 def get_db() -> Session:
@@ -28,8 +32,17 @@ def get_db() -> Session:
 
 @app.get("/healthz")
 def healthz():
-    ping()
-    return {"ok": True}
+    try:
+        ping()
+        return {"ok": True, "db": "up"}
+    except Exception:
+        return Response(
+            content='{"ok": false, "db": "down"}',
+            media_type="application/json",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
 
 
 def _polygon_wkt_from_geojson(gj: Dict[str, Any]) -> str:
@@ -137,3 +150,10 @@ def save_schedule(field_id: str, payload: Dict[str, Any], db: Session = Depends(
                {"fid": field_id, "body": json.dumps(events)})
     db.commit()
     return {"saved": True, "count": len(events)}
+
+@app.get("/fields")
+def list_fields(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text("SELECT id, farm_id, name, boundary_geojson FROM fields ORDER BY id DESC")
+    ).mappings().all()
+    return rows

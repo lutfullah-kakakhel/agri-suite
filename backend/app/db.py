@@ -1,39 +1,43 @@
 # backend/app/db.py
-import os
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from __future__ import annotations
 
+import os
 from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import sessionmaker
 
 
 def _to_psycopg_v3_url(url: str) -> str:
-    # Force SQLAlchemy to use psycopg v3 dialect
+    # Normalize to SQLAlchemy psycopg v3 driver
     if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+psycopg://", 1)
-    elif url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+        url = "postgresql://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg://" + url[len("postgresql://"):]
     return url
 
-def _ensure_sslmode_require(url: str) -> str:
-    # Append sslmode=require if missing (Supabase needs SSL)
-    parsed = urlparse(url)
-    q = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    if "sslmode" not in q:
-        q["sslmode"] = "require"
-    return urlunparse(parsed._replace(query=urlencode(q)))
 
-DATABASE_URL = os.environ["DATABASE_URL"]
-DATABASE_URL = _ensure_sslmode_require(_to_psycopg_v3_url(DATABASE_URL))
+DATABASE_URL = _to_psycopg_v3_url(os.environ["DATABASE_URL"])
 
+# Small, robust pool for Render Free tier + Supabase pooler
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,   # validates connections before use
+    pool_size=5,
+    max_overflow=5,
+    pool_pre_ping=True,   # drop dead/stale connections
+    pool_recycle=1800,    # refresh every 30 minutes
 )
 
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-Base = declarative_base()
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 
 def ping() -> None:
-    # Raises if DB is unreachable
+    # simple DB ping; raises if unreachable
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
