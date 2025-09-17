@@ -1,13 +1,11 @@
-# app/routes_irrigation.py
 from __future__ import annotations
 
-import os
-import json
+import os, json, math
 from uuid import uuid4
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Depends, Response, status
+from fastapi import APIRouter, HTTPException, Depends, Response, status, Body
 from pydantic import BaseModel, Field as PydField
 from supabase import create_client, Client
 from sqlalchemy import text
@@ -15,17 +13,17 @@ from sqlalchemy.orm import Session
 
 from .db import get_db
 
-# ---------------- Router (NO prefix) ----------------
+# -------- Router (NO prefix) --------
 router = APIRouter()
 
-# ---------------- Env / Clients ----------------
+# -------- Env / Clients --------
 SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]  # service role key on Render
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 OPENWEATHER_KEY = os.environ.get("OPENWEATHER_KEY")
 
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------------- Schemas ----------------
+# -------- Schemas --------
 class RecommendationOut(BaseModel):
     recommendation_mm: float
     window_days: int = 3
@@ -37,14 +35,42 @@ class ConfirmBody(BaseModel):
     notes: Optional[str] = None
     inputs: dict
 
-class FieldIn(BaseModel):
-    """Minimal field creation: geometry is required; crop is optional."""
-    geometry: dict = PydField(..., description="GeoJSON Polygon")
-    crop: Optional[str] = PydField(None, description="Optional crop key (e.g., wheat, rice)")
+# -------- Helpers --------
+def _close_ring(coords: list[list[float]]) -> list[list[float]]:
+    if coords and coords[0] != coords[-1]:
+        return coords + [coords[0]]
+    return coords
 
-# ---------------- Helpers ----------------
+def _centroid_and_area(positions: list[list[float]]) -> tuple[float, float, float, float]:
+    """positions: [[lon,lat], ...] (closed). Returns centroid_lat, centroid_lon, area_ha, area_ac."""
+    lats = [p[1] for p in positions]
+    lons = [p[0] for p in positions]
+    lat0 = sum(lats) / len(lats)
+    lon0 = sum(lons) / len(lons)
+
+    m_per_deg_lat = 111_132.0
+    m_per_deg_lon = 111_320.0 * math.cos(math.radians(lat0))
+    xy = [((lon - lon0) * m_per_deg_lon, (lat - lat0) * m_per_deg_lat) for lon, lat in zip(lons, lats)]
+
+    A2 = Cx = Cy = 0.0
+    for i in range(len(xy) - 1):
+        x1, y1 = xy[i]
+        x2, y2 = xy[i + 1]
+        cross = x1 * y2 - x2 * y1
+        A2 += cross
+        Cx += (x1 + x2) * cross
+        Cy += (y1 + y2) * cross
+    A = abs(A2) / 2.0  # m²
+    cx = Cx / (3 * A2) if A2 != 0 else 0.0
+    cy = Cy / (3 * A2) if A2 != 0 else 0.0
+
+    centroid_lon = lon0 + (cx / m_per_deg_lon)
+    centroid_lat = lat0 + (cy / m_per_deg_lat)
+    area_ha = A / 10_000.0
+    area_ac = A / 4_046.8564224
+    return float(centroid_lat), float(centroid_lon), float(area_ha), float(area_ac)
+
 async def fetch_weather_et0(lat: float, lon: float) -> dict:
-    """Fetch next-24h weather snapshot and a simple ET0 proxy."""
     if not OPENWEATHER_KEY:
         raise HTTPException(500, "OPENWEATHER_KEY not set")
     url = (
@@ -55,26 +81,14 @@ async def fetch_weather_et0(lat: float, lon: float) -> dict:
         r = await client.get(url)
         r.raise_for_status()
         data = r.json()
-
-    steps = data.get("list", [])[:8]  # next 24h (3h * 8)
+    steps = data.get("list", [])[:8]  # next 24h
     temps = [i["main"]["temp"] for i in steps]
     rain = sum(i.get("rain", {}).get("3h", 0.0) for i in steps)
     temp_c = round(sum(temps) / len(temps), 1) if temps else 30.0
-
-    # quick ET0/day (Hargreaves-lite; replace with FAO-56 later if needed)
     et0_mm = round(max(0.0, 0.0023 * (temp_c + 17.8)) * 24.0, 1)
-
-    return {
-        "temp_c": temp_c,
-        "rainfall_forecast_mm": round(rain, 1),
-        "et0_mm": et0_mm,
-    }
+    return {"temp_c": temp_c, "rainfall_forecast_mm": round(rain, 1), "et0_mm": et0_mm}
 
 async def fetch_satellite_soil_moisture(lat: float, lon: float) -> Optional[float]:
-    """
-    Try NASA POWER daily soil moisture (SOILM_TOT, kg/m^2).
-    Very rough conversion to % (heuristic). If unavailable/slow, return None.
-    """
     url = (
         "https://power.larc.nasa.gov/api/temporal/daily/point"
         f"?parameters=SOILM_TOT&community=AG&longitude={lon}&latitude={lat}"
@@ -89,69 +103,91 @@ async def fetch_satellite_soil_moisture(lat: float, lon: float) -> Optional[floa
         vals = data["properties"]["parameter"]["SOILM_TOT"]
         day_key = sorted(vals.keys())[-1]
         sm_kg_m2 = float(vals[day_key])
-        # crude: % volumetric ≈ (kg/m^2 over top 10 cm) / 10
-        sm_pct = round((sm_kg_m2 / 10.0), 1)
+        sm_pct = round((sm_kg_m2 / 10.0), 1)  # crude %
         if sm_pct < 0 or sm_pct > 60:
             return None
         return sm_pct
     except Exception:
         return None
 
-def compute_irrigation_mm(
-    crop: Optional[str],
-    temp_c: float,
-    et0_mm: float,
-    rain_mm: float,
-    soil: Optional[float],
-) -> float:
-    """
-    Simplified water need:
-      target = Kc * ET0 - rain
-      soil moisture adjustment reduces target when soil is already wetter.
-    """
+def compute_irrigation_mm(crop: Optional[str], temp_c: float, et0_mm: float, rain_mm: float, soil: Optional[float]) -> float:
     kc = 0.7
-    crop_l = (crop or "").lower().strip()
-    if crop_l in ("rice", "paddy"):
-        kc = 1.1
-    elif crop_l in ("chickpea", "gram"):
-        kc = 0.6
-    elif crop_l in ("maize", "corn"):
-        kc = 0.9
-    elif crop_l in ("cotton",):
-        kc = 1.0
-    # else wheat/unknown ~0.7
+    c = (crop or "").lower().strip()
+    if c in ("rice", "paddy"): kc = 1.1
+    elif c in ("chickpea", "gram"): kc = 0.6
+    elif c in ("maize", "corn"): kc = 0.9
+    elif c in ("cotton",): kc = 1.0
 
     target = max(0.0, kc * et0_mm - rain_mm)
-
     if soil is not None:
-        if soil >= 40:
-            target *= 0.6
-        elif soil >= 30:
-            target *= 0.8
-
+        if soil >= 40: target *= 0.6
+        elif soil >= 30: target *= 0.8
     return round(target, 1)
 
-# ---------------- Routes (NO prefix) ----------------
+# -------- Routes --------
 @router.get("/healthz")
 def healthz():
-    return {"ok": True}
+    return {"ok": True, "db": "up"}
 
 @router.post("/fields")
-def create_field(field: FieldIn, db: Session = Depends(get_db)):
+def create_field(body: dict = Body(...), db: Session = Depends(get_db)):
     """
-    Minimal create: only geometry is required (stored as JSONB in fields.geometry).
-    crop is optional (nullable).
+    Accepts:
+      { "geometry": {GeoJSON Polygon}, "crop": optional, "client_id": optional }
+      OR raw GeoJSON polygon as body.
+    Computes centroid/area on server and inserts into public.fields.
     """
     try:
+        geometry = None
+        crop = None
+        client_id = None
+        if isinstance(body, dict):
+            if "type" in body and "coordinates" in body:
+                geometry = body
+            else:
+                geometry = body.get("geometry")
+                crop = body.get("crop")
+                client_id = body.get("client_id")
+
+        if not isinstance(geometry, dict) or "type" not in geometry or "coordinates" not in geometry:
+            raise HTTPException(status_code=422, detail="Body must include GeoJSON Polygon under 'geometry' or be the GeoJSON itself.")
+        if geometry.get("type") != "Polygon":
+            raise HTTPException(status_code=422, detail="Only GeoJSON Polygon is supported")
+
+        rings = geometry.get("coordinates") or []
+        if not rings or not isinstance(rings[0], list) or len(rings[0]) < 3:
+            raise HTTPException(status_code=422, detail="Polygon must have at least 3 coordinates")
+
+        outer = _close_ring(rings[0])
+        geometry["coordinates"][0] = outer
+        centroid_lat, centroid_lon, area_ha, area_ac = _centroid_and_area(outer)
+
         new_id = str(uuid4())
         sql = text("""
-          insert into public.fields (id, geometry, crop)
-          values (:id, :geometry::jsonb, :crop)
+          insert into public.fields
+            (id, client_id, crop, geometry, centroid_lat, centroid_lon, area_ha, area_ac)
+          values
+            (:id, :client_id, :crop, :geometry::jsonb, :lat, :lon, :area_ha, :area_ac)
           returning id
         """)
-        db.execute(sql, {"id": new_id, "geometry": json.dumps(field.geometry), "crop": field.crop})
+        db.execute(sql, {
+            "id": new_id,
+            "client_id": client_id,
+            "crop": crop,
+            "geometry": json.dumps(geometry),
+            "lat": centroid_lat,
+            "lon": centroid_lon,
+            "area_ha": area_ha,
+            "area_ac": area_ac,
+        })
         db.commit()
-        return {"id": new_id}
+        return {
+            "id": new_id,
+            "centroid": {"lat": centroid_lat, "lon": centroid_lon},
+            "area_ha": area_ha, "area_ac": area_ac, "crop": crop
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Insert failed: {e}")
@@ -159,15 +195,10 @@ def create_field(field: FieldIn, db: Session = Depends(get_db)):
 @router.get(
     "/fields/{field_id}/recommendation",
     response_model=RecommendationOut,
-    responses={202: {"description": "Processing", "content": {"application/json": {}}}},
+    responses={202: {"description": "Processing"}}
 )
 async def get_recommendation(field_id: str, soil_moisture_pct: Optional[float] = None):
-    """
-    Reads centroid (lat/lon) + crop from helper view 'fields_v'.
-    If soil_moisture_pct not provided, tries satellite SM; if not immediately available,
-    returns 202 with an ETA so the app can auto-refresh.
-    """
-    # pull one row with lat/lon and crop
+    # pull lat/lon + crop from fields_v (or directly from fields if you prefer)
     res = sb.table("fields_v").select("*").eq("id", field_id).limit(1).execute()
     rows = res.data or []
     if not rows:
@@ -175,27 +206,17 @@ async def get_recommendation(field_id: str, soil_moisture_pct: Optional[float] =
     f = rows[0]
     lat = f["lat"]
     lon = f["lon"]
-    crop = f.get("crop")  # may be None
+    crop = f.get("crop")
 
-    # weather
     wx = await fetch_weather_et0(lat, lon)
-
-    # soil moisture: manual override or satellite
-    sm = soil_moisture_pct
-    if sm is None:
-        sm = await fetch_satellite_soil_moisture(lat, lon)
+    sm = soil_moisture_pct if soil_moisture_pct is not None else await fetch_satellite_soil_moisture(lat, lon)
 
     if sm is None:
         body = {"status": "processing", "eta_minutes": 2, "note": "Fetching satellite moisture…"}
         return Response(content=json.dumps(body), media_type="application/json", status_code=status.HTTP_202_ACCEPTED)
 
     mm = compute_irrigation_mm(crop, wx["temp_c"], wx["et0_mm"], wx["rainfall_forecast_mm"], sm)
-
-    return {
-        "recommendation_mm": mm,
-        "window_days": 3,
-        "inputs": {"crop": crop, "soil_moisture_pct": sm, **wx},
-    }
+    return {"recommendation_mm": mm, "window_days": 3, "inputs": {"crop": crop, "soil_moisture_pct": sm, **wx}}
 
 @router.post("/fields/{field_id}/recommendation/confirm")
 def confirm_recommendation(field_id: str, body: ConfirmBody):
