@@ -1,0 +1,17 @@
+Project: agri-suite
+Created: 2025-09-14T23:53:40+05:00
+Git branch: feat/update-frontend-from-agro_assist_new
+Git commit: f413555
+Backend URL: https://agri-suite-1.onrender.com
+
+Render environment to recreate:
+  - DATABASE_URL = <Supabase Session Pooler URL>
+  - POSTGRES_SSLMODE = require
+
+Flutter run-time define:
+  - API_BASE_URL = https://agri-suite-1.onrender.com
+
+Restore tips:
+  - backend: python -m pip install -r backend/requirements.txt
+             uvicorn app.main:app --reload
+  - flutter: flutter pub get; flutter run --dart-define=API_BASE_URL=https://agri-suite-1.onrender.com

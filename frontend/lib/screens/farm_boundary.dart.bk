@@ -1,0 +1,225 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
+
+import '../config.dart';
+
+/// Minimal API client for this screen
+class _ApiClient {
+  final String base = AppConfig.apiBaseUrl;
+
+  Future<Map<String, dynamic>> postJson(String path, Map<String, dynamic> body) async {
+    final uri = Uri.parse('$base$path');
+    final r = await http.post(uri, headers: {'Content-Type': 'application/json'}, body: json.encode(body));
+    if (r.statusCode >= 400) {
+      throw Exception('POST $path failed: ${r.statusCode} ${r.body}');
+    }
+    return json.decode(r.body) as Map<String, dynamic>;
+  }
+}
+
+/// Repository to save a field
+class _FieldRepository {
+  final _ApiClient api;
+  _FieldRepository(this.api);
+
+  /// geometry must be a valid GeoJSON Polygon
+  Future<String> saveField({
+    required String name,
+    required Map<String, dynamic> geometry,
+    String crop = 'wheat',
+    String? clientId, // optional per-device UUID if you use it
+  }) async {
+    final payload = <String, dynamic>{
+      'name': name,
+      'crop': crop,
+      'geometry': geometry,
+    };
+    if (clientId != null) payload['client_id'] = clientId;
+
+    final res = await api.postJson('/fields', payload);
+    return (res['id'] ?? '').toString();
+  }
+}
+
+class FarmBoundaryScreen extends StatefulWidget {
+  const FarmBoundaryScreen({super.key});
+
+  @override
+  State<FarmBoundaryScreen> createState() => _FarmBoundaryScreenState();
+}
+
+class _FarmBoundaryScreenState extends State<FarmBoundaryScreen> {
+  final _mapController = MapController();
+  final _repo = _FieldRepository(_ApiClient());
+
+  final List<LatLng> _points = [];
+  bool _saving = false;
+  LatLng _center = const LatLng(33.705, 72.905); // fallback (your previous centroid)
+
+  @override
+  void initState() {
+    super.initState();
+    _initLocation();
+  }
+
+  Future<void> _initLocation() async {
+    try {
+      final enabled = await Geolocator.isLocationServiceEnabled();
+      if (!enabled) return;
+      var perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+      }
+      if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) return;
+      final pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.medium);
+      setState(() => _center = LatLng(pos.latitude, pos.longitude));
+    } catch (_) {
+      // silently ignore; fallback center is fine
+    }
+  }
+
+  void _addPoint(LatLng p) {
+    setState(() => _points.add(p));
+  }
+
+  void _undo() {
+    if (_points.isNotEmpty) {
+      setState(() => _points.removeLast());
+    }
+  }
+
+  void _clear() {
+    setState(() => _points.clear());
+  }
+
+  bool get _hasPolygon => _points.length >= 3;
+
+  Map<String, dynamic> _toGeoJsonPolygon(List<LatLng> pts) {
+    // Ensure the ring is closed (first == last)
+    final coords = pts.map((p) => [p.longitude, p.latitude]).toList();
+    if (coords.first[0] != coords.last[0] || coords.first[1] != coords.last[1]) {
+      coords.add([coords.first[0], coords.first[1]]);
+    }
+    return {
+      "type": "Polygon",
+      "coordinates": [coords],
+    };
+  }
+
+  Future<void> _savePolygon() async {
+    if (!_hasPolygon) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Add at least 3 points to make a boundary.')),
+      );
+      return;
+    }
+    setState(() => _saving = true);
+    try {
+      final gj = _toGeoJsonPolygon(_points);
+
+      // You can prompt for name/crop or hardcode for now
+      const name = 'My Field';
+      const crop = 'wheat';
+
+      final fieldId = await _repo.saveField(
+        name: name,
+        crop: crop,
+        geometry: gj,
+        // clientId: await getClientId(), // if you implemented device UUID earlier
+      );
+
+      if (!mounted) return;
+      // ✅ Return the newly created fieldId to the previous screen
+      Navigator.pop(context, fieldId);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error saving field: $e')));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    
+      final poly = _hasPolygon
+    ? Polygon(
+        points: _points,
+        // Fill color of the polygon:
+        color: Colors.green.withOpacity(0.2),
+        // Border styling:
+        borderColor: Colors.green.shade800,
+        borderStrokeWidth: 3,
+      )
+    : null;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Draw Field Boundary')),
+      body: Stack(
+        children: [
+          FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              initialCenter: _center,
+              initialZoom: 15,
+              onTap: (tapPos, latLng) => _addPoint(latLng),
+            ),
+            children: [
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                userAgentPackageName: 'com.doordars.agro_assist',
+              ),
+              if (poly != null) PolygonLayer(polygons: [poly]),
+              MarkerLayer(markers: _points.map((p) => Marker(
+                point: p,
+                width: 16, height: 16,
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: Colors.green,
+                    border: Border.all(color: Colors.white, width: 2),
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              )).toList()),
+            ],
+          ),
+
+          // Controls
+          Positioned(
+            left: 12, right: 12, bottom: 12,
+            child: Card(
+              elevation: 2,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                child: Row(
+                  children: [
+                    IconButton(
+                      tooltip: 'Undo last point',
+                      onPressed: _points.isEmpty ? null : _undo,
+                      icon: const Icon(Icons.undo),
+                    ),
+                    IconButton(
+                      tooltip: 'Clear',
+                      onPressed: _points.isEmpty ? null : _clear,
+                      icon: const Icon(Icons.delete_outline),
+                    ),
+                    const Spacer(),
+                    ElevatedButton.icon(
+                      onPressed: _saving ? null : _savePolygon,
+                      icon: const Icon(Icons.save),
+                      label: Text(_saving ? 'Saving…' : 'Save'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

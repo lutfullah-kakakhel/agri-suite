@@ -1,4 +1,4 @@
-package com.doordars.agro_assist
+package com.doordars.agroassist
 
 import io.flutter.embedding.android.FlutterActivity
 

@@ -1,0 +1,33 @@
+import 'api_client.dart';
+
+class IrrigationRepository {
+  final ApiClient api;
+  IrrigationRepository(this.api);
+
+  Future<Map<String, dynamic>> getRecommendation({required String fieldId}) async {
+    final res = await api.getAny('/fields/$fieldId/recommendation');
+    return (res as Map).cast<String, dynamic>();
+  }
+
+  Future<String> confirmRecommendation({
+    required String fieldId,
+    required double recommendationMm,
+    int windowDays = 3,
+    String? notes,
+    required Map<String, dynamic> inputs,
+  }) async {
+    final data = await api.postJson('/fields/$fieldId/recommendation/confirm', {
+      'recommendation_mm': recommendationMm,
+      'window_days': windowDays,
+      'notes': notes,
+      'inputs': inputs,
+    });
+    return (data['id'] ?? '').toString();
+  }
+
+  Future<List<Map<String, dynamic>>> listSchedules(String fieldId) async {
+    final res = await api.getAny('/fields/$fieldId/schedules');
+    if (res is List) return res.cast<Map<String, dynamic>>();
+    return [];
+  }
+}
