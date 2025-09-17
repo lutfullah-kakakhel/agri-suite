@@ -1,7 +1,8 @@
 fastapi
 uvicorn[standard]
-psycopg[binary]==3.2.10
+supabase>=2.5       # you’re using Supabase client in routes
 httpx
 pydantic
 sqlalchemy>=2.0
+psycopg[binary]==3.2.10
 python-dotenv
