@@ -234,6 +234,14 @@ def confirm_recommendation(field_id: str, body: ConfirmBody):
     )
     return {"ok": True, "id": (ins.data or [{}])[0].get("id")}
 
+@router.post("/fields2")
+def create_field2(body: dict = Body(...), db: Session = Depends(get_db)):
+    return create_field(body=body, db=db)
+
+
+
+
+
 @router.get("/fields/{field_id}/schedules")
 def list_schedules(field_id: str):
     q = (
