@@ -159,29 +159,29 @@ async def advice_raw(f: FieldIn):
     return make_advice_payload(f.name, f.crop, f.centroid_lat, f.centroid_lon, f.last_irrigation_ts, wx)
 
 # ---------- Fields CRUD + advice-by-id ----------
-@app.post("/fields", response_model=FieldOut)
-def create_field(payload: FieldCreate, db: Session = Depends(get_db)):
-    field = FieldModel(
-        name=payload.name,
-        crop=payload.crop,
-        centroid_lat=payload.centroid_lat,
-        centroid_lon=payload.centroid_lon,
-        polygon_geojson=payload.polygon_geojson,
-        last_irrigation_ts=payload.last_irrigation_ts
-    )
-    db.add(field)
-    db.commit()
-    db.refresh(field)
-    return field
+#@app.post("/fields", response_model=FieldOut)
+#def create_field(payload: FieldCreate, db: Session = Depends(get_db)):
+#    field = FieldModel(
+#        name=payload.name,
+#        crop=payload.crop,
+#        centroid_lat=payload.centroid_lat,
+#        centroid_lon=payload.centroid_lon,
+#        polygon_geojson=payload.polygon_geojson,
+#        last_irrigation_ts=payload.last_irrigation_ts
+#    )
+#    db.add(field)
+#    db.commit()
+#    db.refresh(field)
+#    return field
 
-@app.get("/fields", response_model=list[FieldOut])
-def list_fields(db: Session = Depends(get_db)):
-    return db.query(FieldModel).order_by(FieldModel.id.desc()).all()
+#@app.get("/fields", response_model=list[FieldOut])
+#def list_fields(db: Session = Depends(get_db)):
+#    return db.query(FieldModel).order_by(FieldModel.id.desc()).all()
 
-@app.get("/fields/{field_id}/advice")
-async def advice_by_id(field_id: int, db: Session = Depends(get_db)):
-    rec = db.query(FieldModel).get(field_id)
-    if not rec:
-        raise HTTPException(status_code=404, detail="Field not found")
-    wx = await fetch_weather(rec.centroid_lat, rec.centroid_lon)
-    return make_advice_payload(rec.name, rec.crop, rec.centroid_lat, rec.centroid_lon, rec.last_irrigation_ts, wx)
+#@app.get("/fields/{field_id}/advice")
+#async def advice_by_id(field_id: int, db: Session = Depends(get_db)):
+#    rec = db.query(FieldModel).get(field_id)
+#    if not rec:
+#        raise HTTPException(status_code=404, detail="Field not found")
+#    wx = await fetch_weather(rec.centroid_lat, rec.centroid_lon)
+#    return make_advice_payload(rec.name, rec.crop, rec.centroid_lat, rec.centroid_lon, rec.last_irrigation_ts, wx)
